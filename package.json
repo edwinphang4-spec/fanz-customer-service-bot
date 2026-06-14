@@ -1,0 +1,13 @@
+{
+  "name": "fanz-customer-service-bot",
+  "version": "1.0.0",
+  "description": "Fanz Sdn Bhd Customer Service Telegram Bot (Chinese/English)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "googleapis": "^144.0.0",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
