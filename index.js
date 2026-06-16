@@ -143,12 +143,14 @@ const SUPABASE_HEADERS = SUPABASE_SERVICE_KEY
   ? { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`, "Content-Type": "application/json" }
   : null;
 
-// Query sales_records by invoice number
+// Query sales_records by invoice number (case-insensitive, trims whitespace)
 async function lookupInvoice(invoiceNumber) {
   if (!SUPABASE_SERVICE_KEY) return null;
+  const trimmed = (invoiceNumber || "").trim();
+  if (!trimmed) return null;
   try {
     const resp = await fetch(
-      `${SUPABASE_URL}/rest/v1/sales_records?invoice_number=eq.${encodeURIComponent(invoiceNumber)}&select=*`,
+      `${SUPABASE_URL}/rest/v1/sales_records?invoice_number=ilike.*${encodeURIComponent(trimmed)}*&select=*`,
       { headers: SUPABASE_HEADERS }
     );
     if (!resp.ok) return null;
@@ -260,6 +262,48 @@ async function appendToSheet(rowData) {
   }
 }
 
+// ── Localization ──────────────────────────────────
+function detectLang(text) {
+  return /[一-鿿]/.test(text || "") ? "zh" : "en";
+}
+
+const TRANSLATIONS = {
+  warranty_in: {
+    en: ({ model, date }) => `✅ Your fan (${model}, purchased ${date}) is within the 10-year warranty period.`,
+    zh: ({ model, date }) => `✅ 您的吊扇 (${model}，购买日期 ${date}) 在 10 年保修期内。`,
+  },
+  warranty_out: {
+    en: ({ model, date }) => `⚠️ Your fan (${model}, purchased ${date}) is outside the 10-year warranty period. Our team will provide a service quotation.`,
+    zh: ({ model, date }) => `⚠️ 您的吊扇 (${model}，购买日期 ${date}) 已超过 10 年保修期。我们的团队将为您提供维修报价。`,
+  },
+  warranty_not_found: {
+    en: "ℹ️ We could not find this invoice in our system. A colleague will manually verify your warranty status.",
+    zh: "ℹ️ 系统中找不到此发票号码。我们的同事将手动核实您的保修状态。",
+  },
+  workorder_recorded: {
+    en: "✅ Your repair request has been recorded. Our technician will contact you to arrange the visit.",
+    zh: "✅ 您的维修申请已记录。我们的技术员将与您联系安排上门时间。",
+  },
+  workorder_busy: {
+    en: "⚠️ System is temporarily busy. Your request has been forwarded to our human team who will follow up with you. Thank you for your patience.",
+    zh: "⚠️ 系统暂时繁忙。您的申请已转交给我们的人工团队跟进。感谢您的耐心等待。",
+  },
+  complaint_busy: {
+    en: "⚠️ System is temporarily busy. Your feedback has been forwarded to our human team who will personally follow up with you.",
+    zh: "⚠️ 系统暂时繁忙。您的反馈已转交给我们的人工团队亲自跟进。",
+  },
+  error_connect: {
+    en: "Sorry, I'm having trouble connecting right now. Please try again later.",
+    zh: "抱歉，我现在连接出现问题，请稍后再试。",
+  },
+};
+
+function tr(key, lang, params) {
+  const entry = TRANSLATIONS[key];
+  const value = entry[lang] || entry.en;
+  return typeof value === "function" ? value(params || {}) : value;
+}
+
 // ── Parse AI response markers ──────────────────────
 function parseMarker(reply) {
   const lines = reply.split("\n");
@@ -367,6 +411,9 @@ bot.on("message", async (msg) => {
     // Parse marker from response
     const { clean, marker, data } = parseMarker(reply);
 
+    // Detect language from current user message for localized system messages
+    const lang = detectLang(text);
+
     // ── Process WORKORDER_READY marker ──────────────
     if (marker === "WORKORDER_READY" && data) {
       let warrantyMsg = "";
@@ -377,12 +424,13 @@ bot.on("message", async (msg) => {
         const record = await lookupInvoice(data.invoice.trim());
         if (record) {
           warrantyStatus = calcWarrantyStatus(record.purchase_date);
-          warrantyMsg =
-            warrantyStatus === "in_warranty"
-              ? `✅ Your fan (${record.model}, purchased ${record.purchase_date}) is within the 10-year warranty period.`
-              : `⚠️ Your fan (${record.model}, purchased ${record.purchase_date}) is outside the 10-year warranty period. Our team will provide a service quotation.`;
+          warrantyMsg = tr(
+            warrantyStatus === "in_warranty" ? "warranty_in" : "warranty_out",
+            lang,
+            { model: record.model, date: record.purchase_date }
+          );
         } else {
-          warrantyMsg = "ℹ️ We could not find this invoice in our system. A colleague will manually verify your warranty status.";
+          warrantyMsg = tr("warranty_not_found", lang);
         }
       }
 
@@ -395,10 +443,10 @@ bot.on("message", async (msg) => {
 
       // Build final message
       let finalMsg = clean;
-      if (warrantyMsg) finalMsg += "\n\n" + warrantyMsg + "\n\n✅ Your repair request has been recorded. Our technician will contact you to arrange the visit.";
+      if (warrantyMsg) finalMsg += "\n\n" + warrantyMsg + "\n\n" + tr("workorder_recorded", lang);
 
       if (!inserted) {
-        finalMsg += "\n\n⚠️ System is temporarily busy. Your request has been forwarded to our human team who will follow up with you. Thank you for your patience.";
+        finalMsg += "\n\n" + tr("workorder_busy", lang);
       }
 
       // Send reply (strip marker)
@@ -412,7 +460,7 @@ bot.on("message", async (msg) => {
 
       let finalMsg = clean;
       if (!inserted) {
-        finalMsg += "\n\n⚠️ System is temporarily busy. Your feedback has been forwarded to our human team who will personally follow up with you.";
+        finalMsg += "\n\n" + tr("complaint_busy", lang);
       }
 
       await sendWithSplit(chatId, finalMsg);
@@ -423,10 +471,7 @@ bot.on("message", async (msg) => {
     await sendWithSplit(chatId, reply);
   } catch (err) {
     console.error(`[chatId=${chatId}] Error:`, err.message);
-    bot.sendMessage(
-      chatId,
-      "Sorry, I'm having trouble connecting right now. Please try again later.\n抱歉，我现在连接出现问题，请稍后再试。"
-    );
+    bot.sendMessage(chatId, tr("error_connect", detectLang(text)));
   }
 });
 
