@@ -53,6 +53,7 @@ ${productLines}
 1. DO NOT make up prices. If customer asks price, just say need our sales team quote, and pass them the phone/email.
 
 2. WARRANTY CHECK: When customer mentions repair, ask for invoice number. System will auto check warranty (10 years from purchase date) and show result to customer.
+   IMPORTANT: Do NOT say "let me check the warranty", "checking warranty", "查询中", "稍后显示结果", or anything that implies you are doing a real-time lookup. You are ONLY collecting information. The system handles warranty check and displays the result automatically after you submit. Just ask for the invoice number, move on to the next step.
 
 3. There are THREE service lines. Figure out which one from customer's message:
 
@@ -64,8 +65,8 @@ LINE B — Repair / Maintenance: Collect these FIVE things ONE AT A TIME. After 
    Step 3 — Invoice number (tell them need invoice to check warranty)
    Step 4 — Address for service visit
    Step 5 — Preferred date and time
-   After all 5 collected, say (Chinese): "好的，报修资料已经收到，师傅会联系您安排上门时间。" / (English): "Got it, your repair request is in. Our technician will contact you to arrange the visit."
-   **IMPORTANT — data output format**: After the closing line, on the LAST LINE of your response, output EXACTLY this format (no extra characters):
+After all 5 collected, do NOT write any closing message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
+   **IMPORTANT — data output format**: On the LAST LINE of your response, output EXACTLY this format (no extra characters):
    ||DATA||{"model":"[model]","issue":"[issue]","invoice":"[invoice]","address":"[address]","preferred_time":"[time]"}||END||[WORKORDER_READY]
    Replace [bracketed] fields with what customer provided. If any field missing, use empty string. This line is internal, will be stripped before customer sees it.
 
@@ -155,12 +156,16 @@ async function lookupInvoice(invoiceNumber) {
   const trimmed = (invoiceNumber || "").trim();
   if (!trimmed) return null;
   try {
-    const resp = await fetch(
-      `${SUPABASE_URL}/rest/v1/sales_records?invoice_number=ilike.*${encodeURIComponent(trimmed)}*&select=*`,
-      { headers: SUPABASE_HEADERS }
-    );
-    if (!resp.ok) return null;
+    const queryUrl = `${SUPABASE_URL}/rest/v1/sales_records?invoice_number=ilike.${encodeURIComponent(trimmed)}&select=*`;
+    console.log(`[lookupInvoice] Query: ${queryUrl}`);
+    const resp = await fetch(queryUrl, { headers: SUPABASE_HEADERS });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error(`[lookupInvoice] HTTP ${resp.status}: ${errText}`);
+      return null;
+    }
     const rows = await resp.json();
+    console.log(`[lookupInvoice] Rows returned: ${rows.length}`);
     return rows.length > 0 ? rows[0] : null;
   } catch (err) {
     console.error("Supabase lookupInvoice error:", err.message);
