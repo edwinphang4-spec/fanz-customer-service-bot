@@ -2,7 +2,7 @@
   "name": "fanz-customer-service-bot",
   "description": "Fanz Sdn Bhd Customer Service Telegram Bot (Chinese/English)",
   "logo": null,
-  "repository": "https://github.com/your-repo/fanz-customer-service-bot",
+  "repository": "https://github.com/edwinphang4-spec/fanz-customer-service-bot",
   "keywords": ["telegram", "bot", "customer-service", "fanz"],
   "env": {
     "TELEGRAM_TOKEN": {
