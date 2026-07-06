@@ -129,7 +129,9 @@ LINE C — Complaint: Listen properly, acknowledge, say will pass to the relevan
 
 7. If a message is just "?" or "any update" — the customer is chasing progress. Apologize briefly and say you will chase the team, do not treat it as a new topic.
 
-8. If not sure about something, just say so and offer to pass to human team.`;
+8. Messages prefixed "[voice message, transcribed]" are the customer's spoken words converted to text. Treat them as normal customer messages. Transcription can contain small errors — if a critical detail (model, address, invoice number) seems garbled, confirm it briefly instead of guessing.
+
+9. If not sure about something, just say so and offer to pass to human team.`;
 }
 
 const SYSTEM_PROMPT = buildSystemPrompt();
@@ -572,6 +574,38 @@ function classifyMedia(msg) {
   return null;
 }
 
+// ── Voice transcription ──────────────────────────
+// Real customers describe faults by voice constantly (BM customers
+// especially). Transcribed text flows through the SAME pipeline as typed
+// text — money red lines and the unpaid gate apply to voice too.
+const { transcribeVoice, isConfigured: transcribeConfigured, MAX_VOICE_SECONDS } = require("./lib/transcribe");
+
+async function tryTranscribeVoice(msg) {
+  const media = msg.voice || msg.audio;
+  if (!media || !transcribeConfigured()) return null;
+  if ((media.duration || 0) > MAX_VOICE_SECONDS) {
+    console.log(`[voice] too long (${media.duration}s) — falling back to type-please`);
+    return null;
+  }
+  try {
+    const link = await bot.getFileLink(media.file_id);
+    const resp = await fetch(link);
+    if (!resp.ok) throw new Error(`file download ${resp.status}`);
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    const ext = (link.split(".").pop() || "oga").toLowerCase();
+    const result = await transcribeVoice(buffer, `voice.${ext}`);
+    if (!result.ok) {
+      console.warn(`[voice] transcription failed: ${result.error}`);
+      return null;
+    }
+    console.log(`[voice] transcribed ${media.duration || "?"}s -> "${result.text.slice(0, 80)}"`);
+    return result.text;
+  } catch (err) {
+    console.warn(`[voice] error: ${err.message}`);
+    return null;
+  }
+}
+
 // ── Message Handler ──────────────────────────────
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
@@ -580,13 +614,25 @@ bot.on("message", async (msg) => {
   // Skip commands handled above
   if (text.startsWith("/")) return;
 
-  // ── R1: non-text messages — acknowledge, guide, remember ──
+  // ── R1: non-text messages — transcribe voice, acknowledge the rest ──
   // Every real customer chat opened with a photo/video/voice. Silence here
   // is the single worst first impression the bot can make.
   const mediaType = classifyMedia(msg);
   if (!text && mediaType) {
-    const lang = detectLangFromHistory(chatId, msg.caption || "");
     mediaSeen.set(chatId, true);
+
+    // Voice: transcribe and route through the normal text pipeline.
+    // Falls back to the type-please script when the key is missing,
+    // the clip is too long, or transcription fails.
+    if (mediaType === "voice") {
+      const transcribed = await tryTranscribeVoice(msg);
+      if (transcribed) {
+        await processCustomerText(chatId, transcribed, { fromVoice: true });
+        return;
+      }
+    }
+
+    const lang = detectLangFromHistory(chatId, msg.caption || "");
     // Annotate history so the LLM knows evidence exists and intake can skip re-asking
     const label = { photo: "photo", video: "video", voice: "voice message", other: "file" }[mediaType];
     appendHistory(chatId, "user", `[customer sent a ${label}${msg.caption ? `, caption: "${msg.caption}"` : ""}]`);
@@ -596,6 +642,17 @@ bot.on("message", async (msg) => {
 
   // Ignore empty messages
   if (!text) return;
+
+  await processCustomerText(chatId, text);
+});
+
+// ── Shared text pipeline ──────────────────────────
+// Single entry point for typed text AND transcribed voice: deterministic
+// guards first (money red lines, unpaid gate, nudge), then the LLM.
+async function processCustomerText(chatId, text, opts = {}) {
+  // How this turn is recorded in history — transcribed voice is prefixed so
+  // the model knows the words came from audio (see system prompt rule).
+  const historyText = opts.fromVoice ? `[voice message, transcribed] ${text}` : text;
 
   // Show typing indicator
   bot.sendChatAction(chatId, "typing");
@@ -607,7 +664,7 @@ bot.on("message", async (msg) => {
   // model's judgement: fixed script + escalation record, conversation over.
   const moneyIntent = detectMoneyIntent(text);
   if (moneyIntent) {
-    appendHistory(chatId, "user", text);
+    appendHistory(chatId, "user", historyText);
     const reply = script(moneyIntent, langNow);
     // History gets a compact annotation instead of the full script, so a
     // mid-intake LLM knows the topic was escalated and CONTINUES the intake
@@ -625,7 +682,7 @@ bot.on("message", async (msg) => {
   // new repair request — re-triggering would derail the flow.
   if (!unpaidGateFired.has(chatId) && detectRepairIntent(text) && (await hasUnpaidOrder(chatId))) {
     unpaidGateFired.set(chatId, Date.now());
-    appendHistory(chatId, "user", text);
+    appendHistory(chatId, "user", historyText);
     appendHistory(chatId, "assistant",
       "[system note: customer has an outstanding payment; they were asked to settle it first and a colleague will follow up. Do not arrange a new appointment; you may still answer product questions.]");
     await sendWithSplit(chatId, script("unpaid", langNow));
@@ -635,7 +692,7 @@ bot.on("message", async (msg) => {
 
   // ── NUDGE — bare "?" / "any update" means "chase progress" ──
   if (isNudge(text) && getHistory(chatId).length > 0) {
-    appendHistory(chatId, "user", text);
+    appendHistory(chatId, "user", historyText);
     const reply = script("nudge", langNow);
     appendHistory(chatId, "assistant", reply);
     await sendWithSplit(chatId, reply);
@@ -655,14 +712,14 @@ bot.on("message", async (msg) => {
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
       ...history,
-      { role: "user", content: text },
+      { role: "user", content: historyText },
     ];
 
     // Call OpenRouter
     const reply = await askOpenRouter(messages);
 
     // Save to history (original reply including marker)
-    appendHistory(chatId, "user", text);
+    appendHistory(chatId, "user", historyText);
     appendHistory(chatId, "assistant", reply);
 
     // Parse marker from response
@@ -810,7 +867,7 @@ bot.on("message", async (msg) => {
     console.error(`[chatId=${chatId}] Error:`, err.message);
     bot.sendMessage(chatId, tr("error_connect", detectLang(text)));
   }
-});
+}
 
 // ── Helpers ──────────────────────────────────────
 function splitMessage(text, maxLen = 4096) {
@@ -857,4 +914,5 @@ module.exports = {
   detectLangFromHistory,
   insertWorkOrder,
   classifyMedia,
+  processCustomerText,
 };
