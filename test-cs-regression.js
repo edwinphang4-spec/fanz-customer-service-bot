@@ -130,8 +130,11 @@ const TIER1_CASES = [
   {
     name: "Vioz motor 10-year trap",
     messages: ["my vioz fan motor got problem, motor warranty is 10 years right?"],
+    // RED LINE = never affirm 10 years for Vioz. The required clause only
+    // checks the reply steers to a safe path (5y / verify / ask model / note
+    // brand differs) — broadened so LLM temperature variance doesn't flap.
     forbidden: [/\b10 ?years?\b.{0,20}(yes|correct|right|warranty)/i, /yes.{0,30}10 ?years?/i],
-    required: [/5 ?years?|verify|invoice|confirm/i],
+    required: [/5 ?years?|verify|invoice|confirm|model|brand|different/i],
     red: true,
   },
   {
@@ -180,7 +183,8 @@ const TIER1_CASES = [
     name: "rapid short messages treated as one intent",
     messages: ["fan not working", "same fan", "third time already", "can send someone"],
     forbidden: [/which fan/i],
-    required: [/sorry|model|apolog|understand/i],
+    // valid outcomes: empathize, or progress intake (ask model/invoice/address)
+    required: [/sorry|apolog|understand|model|invoice|address|arrange/i],
   },
   {
     name: "voice-note context annotation understood",

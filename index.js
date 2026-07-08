@@ -95,6 +95,7 @@ LINE B — Repair / Maintenance: Collect these items ONE AT A TIME. After each r
    Step 1 — Model / fan name (also determines brand: Fanz or Vioz; if unclear from model, ask which brand)
    Step 2 — What's the problem  AND  Which part is having the issue（马达/Motor、接收器/Receiver、LED灯/LED、遥控器/Remote、要求上门服务/On-site service、其他/Other — pick one）
    Step 3 — Invoice number OR a photo of the invoice (dealer invoices are fine too). If the customer already sent an invoice photo, note it and move on — do not ask again.
+     If history contains an "[customer sent an INVOICE photo — auto-read...]" line, the invoice step is DONE: use its brand/model/purchase_date to fill the DATA fields (invoice:"photo"), do NOT re-ask for the invoice, and do NOT state a warranty verdict or say whether it's in/out of warranty — a colleague verifies that. You may still need Step 4/5 (address, time).
    Step 4 — Address for service visit
    Step 5 — PREFERRED date and time (preference only — see APPOINTMENT RULE)
 After all collected, STRICTLY FORBIDDEN: Do NOT write ANY closing/confirmation message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
@@ -129,7 +130,9 @@ LINE C — Complaint: Listen properly, acknowledge, say will pass to the relevan
 
 7. If a message is just "?" or "any update" — the customer is chasing progress. Apologize briefly and say you will chase the team, do not treat it as a new topic.
 
-8. If not sure about something, just say so and offer to pass to human team.`;
+8. Messages prefixed "[voice message, transcribed]" are the customer's spoken words converted to text. Treat them as normal customer messages. Transcription can contain small errors — if a critical detail (model, address, invoice number) seems garbled, confirm it briefly instead of guessing.
+
+9. If not sure about something, just say so and offer to pass to human team.`;
 }
 
 const SYSTEM_PROMPT = buildSystemPrompt();
@@ -313,6 +316,7 @@ async function hasUnpaidOrder(chatId) {
 // Customers open with photos/videos/voice constantly (all real chats did).
 // Track per chat so the work order carries has_media.
 const mediaSeen = new Map(); // chatId -> true
+const invoiceInFlight = new Set(); // chatIds currently having an invoice read (avoid double echo on fast double-send)
 
 // ── Guard debounce state ──────────────────────────
 // Unpaid gate fires ONCE per chat (first repair mention) — re-triggering on
@@ -572,6 +576,116 @@ function classifyMedia(msg) {
   return null;
 }
 
+// ── Voice transcription ──────────────────────────
+// Real customers describe faults by voice constantly (BM customers
+// especially). Transcribed text flows through the SAME pipeline as typed
+// text — money red lines and the unpaid gate apply to voice too.
+const { transcribeVoice, isConfigured: transcribeConfigured, MAX_VOICE_SECONDS } = require("./lib/transcribe");
+const { readInvoice, isConfigured: invoiceReaderConfigured } = require("./lib/invoice-reader");
+
+// ── Invoice reader: customer sends an invoice photo as warranty proof ──
+// Download the image and vision-extract {brand, model, purchase date, dealer}
+// (zero customer PII). Returns the structured result, or null if it can't be
+// read / isn't an invoice / no key. PDFs and non-image files are not auto-read
+// (no rasterizer here) — they fall through to the generic media acknowledgement.
+async function tryReadInvoice(msg) {
+  if (!invoiceReaderConfigured()) return null;
+  let fileId, mime;
+  if (msg.photo && msg.photo.length) {
+    fileId = msg.photo[msg.photo.length - 1].file_id; // largest size
+    mime = "image/jpeg";
+  } else if (msg.document && /^image\/(jpe?g|png|webp)$/i.test(msg.document.mime_type || "")) {
+    fileId = msg.document.file_id;
+    mime = msg.document.mime_type;
+  } else {
+    return null;
+  }
+  try {
+    const link = await bot.getFileLink(fileId);
+    const resp = await fetch(link);
+    if (!resp.ok) throw new Error(`file download ${resp.status}`);
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    const r = await readInvoice(buffer, mime);
+    if (!r.ok) { console.warn(`[invoice] read failed: ${r.error}`); return null; }
+    return r.result;
+  } catch (err) {
+    console.warn(`[invoice] error: ${err.message}`);
+    return null;
+  }
+}
+
+// Customer-facing echo of what we read — for CONFIRMATION, not a warranty verdict.
+// Always asks the customer to confirm the date (misread date = wrong warranty),
+// asks which fan if multiple, and never states a warranty length (human verifies).
+function buildInvoiceEcho(inv, lang) {
+  // Clean display label per line: prefer the normalized "Brand Family Size"
+  // over the raw invoice string (which can be long/ugly). Raw strings still go
+  // to the human handoff via the history annotation.
+  const label = (l) => {
+    const fam = l.family || (l.modelText || "").slice(0, 28);
+    const withBrand = /vioz|fanz/i.test(fam) ? fam : `${l.brand === "vioz" ? "Vioz" : "Fanz"} ${fam}`;
+    return `${withBrand}${l.size ? " " + l.size : ""}`.trim();
+  };
+  const models = [...new Set(inv.fanzLines.map(label).filter(Boolean))].slice(0, 3).join(", ") || "-";
+  const dateShown = inv.purchaseDateIso || inv.purchaseDateRaw || "";
+  const multi = inv.multipleFans;
+  // ALWAYS ask the customer to confirm the date. A confident-but-wrong date
+  // (DD/MM vs MM/DD, 2-digit year) is the highest-consequence silent error for
+  // warranty — don't rely on the model self-reporting ambiguity.
+
+  if (lang === "zh") {
+    let m = `收到发票啦 ✅ 我这边读到：${models}`;
+    m += dateShown ? `，购买日期 ${dateShown}` : "";
+    m += "。";
+    m += dateShown ? `麻烦你确认一下购买日期对不对哦？` : `购买日期我看不太清，可以打一下购买日期吗？`;
+    if (multi) m += ` 这张单有几款风扇，请问是哪一款出问题？`;
+    m += ` 同事会根据这个帮你核实保修状态。`;
+    return m;
+  }
+  if (lang === "ms") {
+    let m = `Dah terima invoice awak ✅ Saya baca: ${models}`;
+    m += dateShown ? `, tarikh beli ${dateShown}` : "";
+    m += ".";
+    m += dateShown ? ` Boleh confirm tarikh beli tu betul tak?` : ` Tarikh beli tak berapa jelas, boleh taip tarikh beli awak?`;
+    if (multi) m += ` Invoice ni ada beberapa kipas — yang mana satu ada masalah ya?`;
+    m += ` Colleague kami akan verify status warranty berdasarkan ni.`;
+    return m;
+  }
+  let m = `Got your invoice ✅ I read: ${models}`;
+  m += dateShown ? `, purchase date ${dateShown}` : "";
+  m += ".";
+  m += dateShown ? ` Could you confirm the purchase date is correct?` : ` The purchase date isn't clear — could you type the purchase date?`;
+  if (multi) m += ` This invoice has a few fans — which one has the issue?`;
+  m += ` My colleague will verify your warranty status from this.`;
+  return m;
+}
+
+async function tryTranscribeVoice(msg) {
+  const media = msg.voice || msg.audio;
+  if (!media || !transcribeConfigured()) return null;
+  if ((media.duration || 0) > MAX_VOICE_SECONDS) {
+    console.log(`[voice] too long (${media.duration}s) — falling back to type-please`);
+    return null;
+  }
+  try {
+    const link = await bot.getFileLink(media.file_id);
+    const resp = await fetch(link);
+    if (!resp.ok) throw new Error(`file download ${resp.status}`);
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    const ext = (link.split(".").pop() || "oga").toLowerCase();
+    const result = await transcribeVoice(buffer, `voice.${ext}`);
+    if (!result.ok) {
+      console.warn(`[voice] transcription failed: ${result.error}`);
+      return null;
+    }
+    console.log(`[voice] transcribed ${media.duration || "?"}s -> "${result.text.slice(0, 80)}"`);
+    return result.text;
+  } catch (err) {
+    console.warn(`[voice] error: ${err.message}`);
+    return null;
+  }
+}
+
 // ── Message Handler ──────────────────────────────
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
@@ -580,13 +694,61 @@ bot.on("message", async (msg) => {
   // Skip commands handled above
   if (text.startsWith("/")) return;
 
-  // ── R1: non-text messages — acknowledge, guide, remember ──
+  // ── R1: non-text messages — transcribe voice, acknowledge the rest ──
   // Every real customer chat opened with a photo/video/voice. Silence here
   // is the single worst first impression the bot can make.
   const mediaType = classifyMedia(msg);
   if (!text && mediaType) {
-    const lang = detectLangFromHistory(chatId, msg.caption || "");
     mediaSeen.set(chatId, true);
+
+    // Voice: transcribe and route through the normal text pipeline.
+    // Falls back to the type-please script when the key is missing,
+    // the clip is too long, or transcription fails.
+    if (mediaType === "voice") {
+      const transcribed = await tryTranscribeVoice(msg);
+      if (transcribed) {
+        await processCustomerText(chatId, transcribed, { fromVoice: true });
+        return;
+      }
+    }
+
+    const lang = detectLangFromHistory(chatId, msg.caption || "");
+
+    // Photo / image file: try to read it as a warranty-proof invoice. If it
+    // genuinely reads as an invoice with Fanz/Vioz lines, echo the reading for
+    // confirmation and hand structured (PII-free) info to the human intake.
+    // Otherwise (fan photo, unreadable, non-invoice) fall through to the
+    // generic acknowledgement below.
+    if ((mediaType === "photo" || mediaType === "other") && !invoiceInFlight.has(chatId)) {
+      invoiceInFlight.add(chatId);
+      let inv = null;
+      try { inv = await tryReadInvoice(msg); }
+      finally { invoiceInFlight.delete(chatId); }
+      if (inv && inv.isInvoice && inv.fanzLines.length > 0) {
+        const models = inv.fanzLines
+          .map((l) => `${l.modelText}${l.family ? ` (${l.family}/${l.brand})` : ` (${l.brand})`}`)
+          .join("; ");
+        // PII-free structured annotation for the LLM intake + human handoff.
+        // Marked "verify" — the bot never finalizes warranty from this.
+        appendHistory(
+          chatId,
+          "user",
+          `[customer sent an INVOICE photo — auto-read, PLEASE VERIFY: ` +
+          `brand=${inv.brandResolved}; model(s)=${models}; ` +
+          `purchase_date=${inv.purchaseDateIso || inv.purchaseDateRaw || "unclear"}` +
+          `${inv.dateAmbiguous ? " (DATE AMBIGUOUS — confirm with customer)" : ""}; ` +
+          `dealer=${inv.dealer || "?"}; read_confidence=${inv.confidence}]`
+        );
+        await sendWithSplit(chatId, buildInvoiceEcho(inv, lang));
+        appendHistory(
+          chatId,
+          "assistant",
+          "[invoice reading echoed to customer for date confirmation; colleague verifies warranty — do not state a warranty verdict yet]"
+        );
+        return;
+      }
+    }
+
     // Annotate history so the LLM knows evidence exists and intake can skip re-asking
     const label = { photo: "photo", video: "video", voice: "voice message", other: "file" }[mediaType];
     appendHistory(chatId, "user", `[customer sent a ${label}${msg.caption ? `, caption: "${msg.caption}"` : ""}]`);
@@ -596,6 +758,17 @@ bot.on("message", async (msg) => {
 
   // Ignore empty messages
   if (!text) return;
+
+  await processCustomerText(chatId, text);
+});
+
+// ── Shared text pipeline ──────────────────────────
+// Single entry point for typed text AND transcribed voice: deterministic
+// guards first (money red lines, unpaid gate, nudge), then the LLM.
+async function processCustomerText(chatId, text, opts = {}) {
+  // How this turn is recorded in history — transcribed voice is prefixed so
+  // the model knows the words came from audio (see system prompt rule).
+  const historyText = opts.fromVoice ? `[voice message, transcribed] ${text}` : text;
 
   // Show typing indicator
   bot.sendChatAction(chatId, "typing");
@@ -607,7 +780,7 @@ bot.on("message", async (msg) => {
   // model's judgement: fixed script + escalation record, conversation over.
   const moneyIntent = detectMoneyIntent(text);
   if (moneyIntent) {
-    appendHistory(chatId, "user", text);
+    appendHistory(chatId, "user", historyText);
     const reply = script(moneyIntent, langNow);
     // History gets a compact annotation instead of the full script, so a
     // mid-intake LLM knows the topic was escalated and CONTINUES the intake
@@ -625,7 +798,7 @@ bot.on("message", async (msg) => {
   // new repair request — re-triggering would derail the flow.
   if (!unpaidGateFired.has(chatId) && detectRepairIntent(text) && (await hasUnpaidOrder(chatId))) {
     unpaidGateFired.set(chatId, Date.now());
-    appendHistory(chatId, "user", text);
+    appendHistory(chatId, "user", historyText);
     appendHistory(chatId, "assistant",
       "[system note: customer has an outstanding payment; they were asked to settle it first and a colleague will follow up. Do not arrange a new appointment; you may still answer product questions.]");
     await sendWithSplit(chatId, script("unpaid", langNow));
@@ -635,7 +808,7 @@ bot.on("message", async (msg) => {
 
   // ── NUDGE — bare "?" / "any update" means "chase progress" ──
   if (isNudge(text) && getHistory(chatId).length > 0) {
-    appendHistory(chatId, "user", text);
+    appendHistory(chatId, "user", historyText);
     const reply = script("nudge", langNow);
     appendHistory(chatId, "assistant", reply);
     await sendWithSplit(chatId, reply);
@@ -655,14 +828,14 @@ bot.on("message", async (msg) => {
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
       ...history,
-      { role: "user", content: text },
+      { role: "user", content: historyText },
     ];
 
     // Call OpenRouter
     const reply = await askOpenRouter(messages);
 
     // Save to history (original reply including marker)
-    appendHistory(chatId, "user", text);
+    appendHistory(chatId, "user", historyText);
     appendHistory(chatId, "assistant", reply);
 
     // Parse marker from response
@@ -810,7 +983,7 @@ bot.on("message", async (msg) => {
     console.error(`[chatId=${chatId}] Error:`, err.message);
     bot.sendMessage(chatId, tr("error_connect", detectLang(text)));
   }
-});
+}
 
 // ── Helpers ──────────────────────────────────────
 function splitMessage(text, maxLen = 4096) {
@@ -857,4 +1030,6 @@ module.exports = {
   detectLangFromHistory,
   insertWorkOrder,
   classifyMedia,
+  processCustomerText,
+  buildInvoiceEcho, // pure helper, exported for tests
 };
