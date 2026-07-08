@@ -316,6 +316,7 @@ async function hasUnpaidOrder(chatId) {
 // Customers open with photos/videos/voice constantly (all real chats did).
 // Track per chat so the work order carries has_media.
 const mediaSeen = new Map(); // chatId -> true
+const invoiceInFlight = new Set(); // chatIds currently having an invoice read (avoid double echo on fast double-send)
 
 // ── Guard debounce state ──────────────────────────
 // Unpaid gate fires ONCE per chat (first repair mention) — re-triggering on
@@ -626,15 +627,17 @@ function buildInvoiceEcho(inv, lang) {
     return `${withBrand}${l.size ? " " + l.size : ""}`.trim();
   };
   const models = [...new Set(inv.fanzLines.map(label).filter(Boolean))].slice(0, 3).join(", ") || "-";
-  const dateKnown = inv.purchaseDateIso && !inv.dateAmbiguous;
   const dateShown = inv.purchaseDateIso || inv.purchaseDateRaw || "";
   const multi = inv.multipleFans;
+  // ALWAYS ask the customer to confirm the date. A confident-but-wrong date
+  // (DD/MM vs MM/DD, 2-digit year) is the highest-consequence silent error for
+  // warranty — don't rely on the model self-reporting ambiguity.
 
   if (lang === "zh") {
     let m = `收到发票啦 ✅ 我这边读到：${models}`;
     m += dateShown ? `，购买日期 ${dateShown}` : "";
     m += "。";
-    if (!dateKnown) m += dateShown ? `麻烦你确认一下购买日期对不对哦？` : `购买日期我看不太清，可以打一下购买日期吗？`;
+    m += dateShown ? `麻烦你确认一下购买日期对不对哦？` : `购买日期我看不太清，可以打一下购买日期吗？`;
     if (multi) m += ` 这张单有几款风扇，请问是哪一款出问题？`;
     m += ` 同事会根据这个帮你核实保修状态。`;
     return m;
@@ -643,7 +646,7 @@ function buildInvoiceEcho(inv, lang) {
     let m = `Dah terima invoice awak ✅ Saya baca: ${models}`;
     m += dateShown ? `, tarikh beli ${dateShown}` : "";
     m += ".";
-    if (!dateKnown) m += dateShown ? ` Boleh confirm tarikh beli tu betul tak?` : ` Tarikh beli tak berapa jelas, boleh taip tarikh beli awak?`;
+    m += dateShown ? ` Boleh confirm tarikh beli tu betul tak?` : ` Tarikh beli tak berapa jelas, boleh taip tarikh beli awak?`;
     if (multi) m += ` Invoice ni ada beberapa kipas — yang mana satu ada masalah ya?`;
     m += ` Colleague kami akan verify status warranty berdasarkan ni.`;
     return m;
@@ -651,7 +654,7 @@ function buildInvoiceEcho(inv, lang) {
   let m = `Got your invoice ✅ I read: ${models}`;
   m += dateShown ? `, purchase date ${dateShown}` : "";
   m += ".";
-  if (!dateKnown) m += dateShown ? ` Could you confirm the purchase date is correct?` : ` The purchase date isn't clear — could you type the purchase date?`;
+  m += dateShown ? ` Could you confirm the purchase date is correct?` : ` The purchase date isn't clear — could you type the purchase date?`;
   if (multi) m += ` This invoice has a few fans — which one has the issue?`;
   m += ` My colleague will verify your warranty status from this.`;
   return m;
@@ -716,8 +719,11 @@ bot.on("message", async (msg) => {
     // confirmation and hand structured (PII-free) info to the human intake.
     // Otherwise (fan photo, unreadable, non-invoice) fall through to the
     // generic acknowledgement below.
-    if (mediaType === "photo" || mediaType === "other") {
-      const inv = await tryReadInvoice(msg);
+    if ((mediaType === "photo" || mediaType === "other") && !invoiceInFlight.has(chatId)) {
+      invoiceInFlight.add(chatId);
+      let inv = null;
+      try { inv = await tryReadInvoice(msg); }
+      finally { invoiceInFlight.delete(chatId); }
       if (inv && inv.isInvoice && inv.fanzLines.length > 0) {
         const models = inv.fanzLines
           .map((l) => `${l.modelText}${l.family ? ` (${l.family}/${l.brand})` : ` (${l.brand})`}`)

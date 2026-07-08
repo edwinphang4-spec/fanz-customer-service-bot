@@ -8,7 +8,7 @@
 // 真实视觉：OPENROUTER_API_KEY=... FANZ_INVOICE_DIR=/path node test-invoice-reader.js
 // ============================================
 
-const { normalizeModel } = require("./lib/invoice-reader");
+const { normalizeModel, scrubPII } = require("./lib/invoice-reader");
 
 let pass = 0, fail = 0;
 const t = (cond, msg) => { cond ? (pass++, console.log(`PASS: ${msg}`)) : (fail++, console.error(`FAIL: ${msg}`)); };
@@ -30,11 +30,19 @@ const NORM = [
   ["VIOZ-VETTA/56N/OAK+MB", "Vioz Vetta", "vioz"],
   ["FZ-VIOZ C/FAN FF 565", "Vioz FF565", "vioz"],
   ["some random light R808", null, "unknown"],
+  ["proofs of purchase", null, "unknown"],       // 'fs' 子串不再误吞
+  ["roofsheet FS lane", null, "unknown"],
 ];
 for (const [input, fam, brand] of NORM) {
   const r = normalizeModel(input);
   t(r.family === fam && r.brand === brand, `normalize "${input}" -> ${r.family}/${r.brand} (expect ${fam}/${brand})`);
 }
+
+// ── PII scrub (defensive: model must not leak, and neither do we) ──
+t(!/01[- ]?2345678/.test(scrubPII("FS 423 (call 012-3456789)")), "scrubPII strips phone");
+t(scrubPII("Jalan Bakawali 37 Taman X").includes("[redacted]"), "scrubPII strips address tokens");
+t(scrubPII("FS 423 N") === "FS 423 N", "scrubPII leaves a clean model string intact");
+t(scrubPII("HENG HENG PREMIUM SDN BHD") === "HENG HENG PREMIUM SDN BHD", "scrubPII leaves dealer name intact");
 
 // ── Tier 0: echo guardrails ──
 const echo = (over) => buildInvoiceEcho({
@@ -49,7 +57,9 @@ const clean = echo({});
 t(!/\b\d+\s*year|covered under|in warranty|out of warranty|10 year|5 year/i.test(clean), "echo never states a warranty verdict");
 t(/colleague will verify/i.test(clean), "echo defers warranty to a colleague");
 
-// ambiguous date -> asks to confirm the date
+// ALWAYS asks to confirm the date (even a confident one — wrong-but-confident
+// date is the worst silent warranty error)
+t(/confirm the purchase date/i.test(clean), "clear date -> STILL asks to confirm (money-safety)");
 const amb = echo({ dateAmbiguous: true });
 t(/confirm the purchase date/i.test(amb), "ambiguous date -> asks to confirm date");
 
