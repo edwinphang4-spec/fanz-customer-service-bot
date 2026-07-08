@@ -95,6 +95,7 @@ LINE B — Repair / Maintenance: Collect these items ONE AT A TIME. After each r
    Step 1 — Model / fan name (also determines brand: Fanz or Vioz; if unclear from model, ask which brand)
    Step 2 — What's the problem  AND  Which part is having the issue（马达/Motor、接收器/Receiver、LED灯/LED、遥控器/Remote、要求上门服务/On-site service、其他/Other — pick one）
    Step 3 — Invoice number OR a photo of the invoice (dealer invoices are fine too). If the customer already sent an invoice photo, note it and move on — do not ask again.
+     If history contains an "[customer sent an INVOICE photo — auto-read...]" line, the invoice step is DONE: use its brand/model/purchase_date to fill the DATA fields (invoice:"photo"), do NOT re-ask for the invoice, and do NOT state a warranty verdict or say whether it's in/out of warranty — a colleague verifies that. You may still need Step 4/5 (address, time).
    Step 4 — Address for service visit
    Step 5 — PREFERRED date and time (preference only — see APPOINTMENT RULE)
 After all collected, STRICTLY FORBIDDEN: Do NOT write ANY closing/confirmation message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
@@ -579,6 +580,82 @@ function classifyMedia(msg) {
 // especially). Transcribed text flows through the SAME pipeline as typed
 // text — money red lines and the unpaid gate apply to voice too.
 const { transcribeVoice, isConfigured: transcribeConfigured, MAX_VOICE_SECONDS } = require("./lib/transcribe");
+const { readInvoice, isConfigured: invoiceReaderConfigured } = require("./lib/invoice-reader");
+
+// ── Invoice reader: customer sends an invoice photo as warranty proof ──
+// Download the image and vision-extract {brand, model, purchase date, dealer}
+// (zero customer PII). Returns the structured result, or null if it can't be
+// read / isn't an invoice / no key. PDFs and non-image files are not auto-read
+// (no rasterizer here) — they fall through to the generic media acknowledgement.
+async function tryReadInvoice(msg) {
+  if (!invoiceReaderConfigured()) return null;
+  let fileId, mime;
+  if (msg.photo && msg.photo.length) {
+    fileId = msg.photo[msg.photo.length - 1].file_id; // largest size
+    mime = "image/jpeg";
+  } else if (msg.document && /^image\/(jpe?g|png|webp)$/i.test(msg.document.mime_type || "")) {
+    fileId = msg.document.file_id;
+    mime = msg.document.mime_type;
+  } else {
+    return null;
+  }
+  try {
+    const link = await bot.getFileLink(fileId);
+    const resp = await fetch(link);
+    if (!resp.ok) throw new Error(`file download ${resp.status}`);
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    const r = await readInvoice(buffer, mime);
+    if (!r.ok) { console.warn(`[invoice] read failed: ${r.error}`); return null; }
+    return r.result;
+  } catch (err) {
+    console.warn(`[invoice] error: ${err.message}`);
+    return null;
+  }
+}
+
+// Customer-facing echo of what we read — for CONFIRMATION, not a warranty verdict.
+// Always asks the customer to confirm the date (misread date = wrong warranty),
+// asks which fan if multiple, and never states a warranty length (human verifies).
+function buildInvoiceEcho(inv, lang) {
+  // Clean display label per line: prefer the normalized "Brand Family Size"
+  // over the raw invoice string (which can be long/ugly). Raw strings still go
+  // to the human handoff via the history annotation.
+  const label = (l) => {
+    const fam = l.family || (l.modelText || "").slice(0, 28);
+    const withBrand = /vioz|fanz/i.test(fam) ? fam : `${l.brand === "vioz" ? "Vioz" : "Fanz"} ${fam}`;
+    return `${withBrand}${l.size ? " " + l.size : ""}`.trim();
+  };
+  const models = [...new Set(inv.fanzLines.map(label).filter(Boolean))].slice(0, 3).join(", ") || "-";
+  const dateKnown = inv.purchaseDateIso && !inv.dateAmbiguous;
+  const dateShown = inv.purchaseDateIso || inv.purchaseDateRaw || "";
+  const multi = inv.multipleFans;
+
+  if (lang === "zh") {
+    let m = `收到发票啦 ✅ 我这边读到：${models}`;
+    m += dateShown ? `，购买日期 ${dateShown}` : "";
+    m += "。";
+    if (!dateKnown) m += dateShown ? `麻烦你确认一下购买日期对不对哦？` : `购买日期我看不太清，可以打一下购买日期吗？`;
+    if (multi) m += ` 这张单有几款风扇，请问是哪一款出问题？`;
+    m += ` 同事会根据这个帮你核实保修状态。`;
+    return m;
+  }
+  if (lang === "ms") {
+    let m = `Dah terima invoice awak ✅ Saya baca: ${models}`;
+    m += dateShown ? `, tarikh beli ${dateShown}` : "";
+    m += ".";
+    if (!dateKnown) m += dateShown ? ` Boleh confirm tarikh beli tu betul tak?` : ` Tarikh beli tak berapa jelas, boleh taip tarikh beli awak?`;
+    if (multi) m += ` Invoice ni ada beberapa kipas — yang mana satu ada masalah ya?`;
+    m += ` Colleague kami akan verify status warranty berdasarkan ni.`;
+    return m;
+  }
+  let m = `Got your invoice ✅ I read: ${models}`;
+  m += dateShown ? `, purchase date ${dateShown}` : "";
+  m += ".";
+  if (!dateKnown) m += dateShown ? ` Could you confirm the purchase date is correct?` : ` The purchase date isn't clear — could you type the purchase date?`;
+  if (multi) m += ` This invoice has a few fans — which one has the issue?`;
+  m += ` My colleague will verify your warranty status from this.`;
+  return m;
+}
 
 async function tryTranscribeVoice(msg) {
   const media = msg.voice || msg.audio;
@@ -633,6 +710,39 @@ bot.on("message", async (msg) => {
     }
 
     const lang = detectLangFromHistory(chatId, msg.caption || "");
+
+    // Photo / image file: try to read it as a warranty-proof invoice. If it
+    // genuinely reads as an invoice with Fanz/Vioz lines, echo the reading for
+    // confirmation and hand structured (PII-free) info to the human intake.
+    // Otherwise (fan photo, unreadable, non-invoice) fall through to the
+    // generic acknowledgement below.
+    if (mediaType === "photo" || mediaType === "other") {
+      const inv = await tryReadInvoice(msg);
+      if (inv && inv.isInvoice && inv.fanzLines.length > 0) {
+        const models = inv.fanzLines
+          .map((l) => `${l.modelText}${l.family ? ` (${l.family}/${l.brand})` : ` (${l.brand})`}`)
+          .join("; ");
+        // PII-free structured annotation for the LLM intake + human handoff.
+        // Marked "verify" — the bot never finalizes warranty from this.
+        appendHistory(
+          chatId,
+          "user",
+          `[customer sent an INVOICE photo — auto-read, PLEASE VERIFY: ` +
+          `brand=${inv.brandResolved}; model(s)=${models}; ` +
+          `purchase_date=${inv.purchaseDateIso || inv.purchaseDateRaw || "unclear"}` +
+          `${inv.dateAmbiguous ? " (DATE AMBIGUOUS — confirm with customer)" : ""}; ` +
+          `dealer=${inv.dealer || "?"}; read_confidence=${inv.confidence}]`
+        );
+        await sendWithSplit(chatId, buildInvoiceEcho(inv, lang));
+        appendHistory(
+          chatId,
+          "assistant",
+          "[invoice reading echoed to customer for date confirmation; colleague verifies warranty — do not state a warranty verdict yet]"
+        );
+        return;
+      }
+    }
+
     // Annotate history so the LLM knows evidence exists and intake can skip re-asking
     const label = { photo: "photo", video: "video", voice: "voice message", other: "file" }[mediaType];
     appendHistory(chatId, "user", `[customer sent a ${label}${msg.caption ? `, caption: "${msg.caption}"` : ""}]`);
@@ -915,4 +1025,5 @@ module.exports = {
   insertWorkOrder,
   classifyMedia,
   processCustomerText,
+  buildInvoiceEcho, // pure helper, exported for tests
 };
