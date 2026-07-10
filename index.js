@@ -533,9 +533,19 @@ Terus taip masalah awak kat sini ya. Kalau nak cakap dengan orang, bagitahu je.`
 }
 
 // ── Bot Setup ────────────────────────────────────
-// Under SKIP_BOT_INIT, a no-op proxy lets tests require this module without polling.
+// Under SKIP_BOT_INIT, a no-op proxy lets tests require this module without
+// polling. sendMessage is captured into __sentMessages so scenario tests can
+// assert on the bot's actual outbound replies.
+const __sentMessages = [];
 const bot = SKIP_BOT_INIT
-  ? new Proxy({}, { get: () => () => Promise.resolve() })
+  ? new Proxy({}, {
+      get: (_t, prop) => {
+        if (prop === "sendMessage") {
+          return (chatId, text) => { __sentMessages.push({ chatId, text: String(text || "") }); return Promise.resolve(); };
+        }
+        return () => Promise.resolve();
+      },
+    })
   : new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 if (!SKIP_BOT_INIT) {
@@ -1032,4 +1042,7 @@ module.exports = {
   classifyMedia,
   processCustomerText,
   buildInvoiceEcho, // pure helper, exported for tests
+  // scenario-test seams (SKIP_BOT_INIT only)
+  __getSent: () => __sentMessages.slice(),
+  __clearSent: () => { __sentMessages.length = 0; },
 };
