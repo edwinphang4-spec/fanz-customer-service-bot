@@ -71,6 +71,11 @@ function tier0() {
   t(inferBrand("V605") === "fanz", "brand: V605 -> fanz (not vioz)");
   t(inferBrand("VIOZ WINDY MK II") === "vioz", "brand: Vioz Windy -> vioz");
   t(inferBrand("FANZ-VIOZ CF16") === "vioz", "brand: Fanz-Vioz CF16 -> vioz");
+  // "claim warranty" 不是赔偿诉求 —— 报保修不能被误判转人工（detectMoneyIntent 已在顶部导入）
+  t(detectMoneyIntent("can I claim my warranty?") === null, "money: 'claim warranty' is NOT compensation");
+  t(detectMoneyIntent("boleh claim tak") === null, "money: BM 'boleh claim' is NOT compensation");
+  t(detectMoneyIntent("I want compensation for my leave") === "compensation", "money: real compensation still caught");
+  t(detectMoneyIntent("I will claim damages and sue you") === "compensation", "money: claim+damages still caught");
   const w = calcWarrantyStatus("2024-01-01", "motor", "MY", "unknown");
   t(w.needsBrand === true, "warranty: unknown brand + motor -> needsBrand, no verdict");
   const wv = calcWarrantyStatus("2020-01-01", "motor", "MY", "vioz");
