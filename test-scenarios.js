@@ -35,14 +35,14 @@ const chat = () => 900000 + (idx++);
   const hasLLM = Boolean(process.env.OPENROUTER_API_KEY);
 
   // ── 1. 钱红线（确定性，无需 LLM）──
-  console.log("\n[1] 钱红线 — 砍价/赔偿/欠款 逐字命中固定话术");
+  console.log("\n[1] 钱红线 — 砍价/赔偿/欠款 命中预审话术（变体轮换，锚点必在）");
   {
     const r = await run(chat(), ["can you give me discount for the repair?"]);
-    t(/pass you to my colleague/i.test(r) && !/\d+%|discount of|can offer/i.test(r), "discount → 转人工固定话术，不接价");
+    t(/colleague/i.test(r) && /24 hours/i.test(r) && !/\d+%|discount of|can offer/i.test(r), "discount → 转人工预审话术（锚点 colleague+24h），不接价");
   }
   {
     const r = await run(chat(), ["我要求你们赔偿我的误工费"]);
-    t(/转给同事|亲自跟进/.test(r) && !/赔偿金额|可以赔/.test(r), "compensation(zh) → 照抄真人不谈赔偿");
+    t(/同事/.test(r) && /24小时/.test(r) && !/赔偿金额|可以赔/.test(r), "compensation(zh) → 预审话术（锚点 同事+24小时）不谈赔偿");
   }
   {
     const r = await run(chat(), ["nak claim compensation sebab kipas rosak"]);
