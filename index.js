@@ -567,21 +567,27 @@ function tr(key, lang, params) {
 
 // ── Parse AI response markers ──────────────────────
 function parseMarker(reply) {
-  const lines = reply.split("\n");
-  const lastLine = lines[lines.length - 1].trim();
-
-  const match = lastLine.match(/^\|\|DATA\|\|(.+)\|\|END\|\|\[(\w+)\]$/);
-  if (!match) return { clean: reply, marker: null, data: null };
-
+  const raw = reply || "";
+  // Marker 可能出现在任何位置——模型有时把它拼在最后一句的同一行，而不是
+  // 单独一行（2026-07-13 线上实证：整段 ||DATA||{...}||END||[WORKORDER_READY]
+  // 原样漏给了客户，且工单没入库）。所以：全文匹配第一个完整 marker 块。
+  const m = raw.match(/\|\|DATA\|\|([\s\S]+?)\|\|END\|\|\s*\[(\w+)\]/);
+  // 铁律：不管解析成功与否，marker 碎片绝不能到客户眼前——
+  // 完整块、没闭合的残块、孤立的 [XXX_READY] 标签全部刮掉。
+  const scrub = (s) => s
+    .replace(/\|\|DATA\|\|[\s\S]*?\|\|END\|\|\s*(\[\w+\])?/g, "")
+    .replace(/\|\|DATA\|\|[\s\S]*$/g, "")
+    .replace(/\[(WORKORDER_READY|COMPLAINT_READY|HANDOFF_READY)\]/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+  if (!m) return { clean: scrub(raw), marker: null, data: null };
   try {
-    const data = JSON.parse(match[1]);
-    return {
-      clean: lines.slice(0, -1).join("\n").trim(),
-      marker: match[2], // WORKORDER_READY or COMPLAINT_READY
-      data,
-    };
-  } catch {
-    return { clean: reply, marker: null, data: null };
+    const data = JSON.parse(m[1]);
+    return { clean: scrub(raw), marker: m[2], data };
+  } catch (err) {
+    // JSON 坏了：不触发动作，但客户只看到干净文本；数据记日志供人工补录
+    console.warn(`[parseMarker] marker JSON invalid — stripped from customer reply. ${String(err && err.message).slice(0, 100)} | raw: ${m[1].slice(0, 200)}`);
+    return { clean: scrub(raw), marker: null, data: null };
   }
 }
 
@@ -1192,8 +1198,9 @@ async function processCustomerText(chatId, text, opts = {}) {
       return;
     }
 
-    // ── No marker — send reply as-is ────────────────
-    await sendWithSplit(chatId, reply, undefined, { aiModel: MODEL });
+    // ── No marker — send the SCRUBBED text, never the raw reply ──
+    // (raw reply may contain malformed/inline marker debris — live leak 2026-07-13)
+    await sendWithSplit(chatId, clean || reply, undefined, { aiModel: MODEL });
   } catch (err) {
     console.error(`[chatId=${chatId}] Error:`, err.message);
     bot.sendMessage(chatId, tr("error_connect", detectLang(text)));
