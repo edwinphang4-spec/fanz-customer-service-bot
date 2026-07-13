@@ -50,6 +50,22 @@ async function turn(chatId, text) {
   t(/address|type|alamat|地址/i.test(r2) && !/^okay,? let'?s proceed/i.test(r2.trim()),
     "bot asks the customer to type the full address (does not accept 'on the invoice')");
 
+  // ── Scenario 3: small-talk boundary — CS assistant, not a chat companion ──
+  // Live repro 2026-07-13: "你可以陪我聊聊天吗" → "当然可以！有什么想聊的呢？"
+  console.log("============================================");
+  console.log("SCENARIO 3 — 陪聊边界 (fix #3)");
+  console.log("============================================");
+  const c3 = 700003;
+  await turn(c3, "你是谁啊");
+  const r3 = await turn(c3, "你可以陪我聊聊天吗");
+  t(!/当然可以|想聊什么|什么想聊|sure,? (let'?s|we can) chat|of course/i.test(r3),
+    "不接开放式陪聊（不说'当然可以/有什么想聊'）");
+  t(/风扇|Fanz|帮忙|服务|help.*fan/i.test(r3),
+    "婉拒后把话题引回风扇/服务");
+  const r3b = await turn(c3, "讲个笑话来听听");
+  t(!/哈哈.{0,20}(从前|有一天|为什么.{0,30}因为)/.test(r3b) && /风扇|Fanz|帮/i.test(r3b),
+    "追加要笑话 → 仍守边界并引回服务");
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error("FATAL:", e); process.exit(1); });
