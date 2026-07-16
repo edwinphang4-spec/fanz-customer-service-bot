@@ -177,30 +177,60 @@ function clearHistory(chatId) {
 }
 
 // ── OpenRouter Call ──────────────────────────────
-async function askOpenRouter(messages) {
-  const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "HTTP-Referer": "https://fanz.my",
-      "X-Title": "Fanz Customer Service Bot",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages,
-      temperature: 0.7,
-      max_tokens: 1024,
-    }),
-  });
+// 单次瞬时故障（网络闪断/5xx/429/超时）客户不该看到"连不上"——
+// 线上实证 2026-07-13：一次偶发失败直接把 error_connect 甩给了客户。
+// 加 30s 超时 + 瞬时错误退避重试一次；4xx（如 401/400）不重试（重试也没用）。
+const LLM_TIMEOUT_MS = 30_000;
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`OpenRouter ${response.status}: ${errText}`);
+async function askOpenRouterOnce(messages) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "HTTP-Referer": "https://fanz.my",
+        "X-Title": "Fanz Customer Service Bot",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages,
+        temperature: 0.7,
+        max_tokens: 1024,
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const errText = (await response.text()).slice(0, 300);
+      const err = new Error(`OpenRouter ${response.status}: ${errText}`);
+      err.status = response.status;
+      throw err;
+    }
+    const data = await response.json();
+    return data.choices[0].message.content;
+  } finally {
+    clearTimeout(timer);
   }
+}
 
-  const data = await response.json();
-  return data.choices[0].message.content;
+function isTransientLLMError(err) {
+  if (!err) return false;
+  if (err.name === "AbortError") return true;               // 超时
+  if (typeof err.status === "number") return err.status >= 500 || err.status === 429;
+  return true;                                              // 无状态码 = 网络层错误（fetch failed 等）
+}
+
+async function askOpenRouter(messages) {
+  try {
+    return await askOpenRouterOnce(messages);
+  } catch (err) {
+    if (!isTransientLLMError(err)) throw err;
+    console.warn(`[askOpenRouter] transient failure, retrying once: ${String(err.message).slice(0, 120)}`);
+    await new Promise((r) => setTimeout(r, 1500));
+    return await askOpenRouterOnce(messages);
+  }
 }
 
 // ── Supabase REST API ─────────────────────────────
@@ -1258,6 +1288,7 @@ module.exports = {
   processCustomerText,
   buildInvoiceEcho, // pure helper, exported for tests
   logConversation, // conversation-log writer, exported for tests
+  askOpenRouter, // LLM caller with timeout+retry, exported for tests
   buildPreliminaryWarrantyMsg, // pure helper, exported for tests
   isDateConfirmation, // pure helper, exported for tests
   // scenario-test seams (SKIP_BOT_INIT only)
