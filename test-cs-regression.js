@@ -82,6 +82,48 @@ function tier0() {
   t(wv.inWarranty === false && wv.warrantyPeriodYears === 5, "warranty: vioz 2020 motor = 5y, expired by 2026");
   const wf = calcWarrantyStatus("2020-01-01", "motor", "MY", "fanz");
   t(wf.inWarranty === true && wf.warrantyPeriodYears === 10, "warranty: fanz 2020 motor = 10y, still in");
+
+  // ── ③ 品牌一律代码推:模型/客户申报只当参考 ──
+  process.env.SKIP_PROMPT_ONLY = "1"; // tier0 也要 require index(拿 resolveBrand),别真启动 bot
+  const { resolveBrand } = require("./index.js");
+  {
+    // 模型报错品牌(AXEL16 类事故):代码推的赢
+    const r1 = resolveBrand("fanz", "VIOZ V56", null);
+    t(r1.brand === "vioz" && r1.mismatch === true, "brand③: 申报 fanz + 型号 VIOZ → 代码判 vioz + 标记不一致");
+    // 反向验证核心规则:两边都推不出 → unknown,⛔ 不退回信申报的
+    const r2 = resolveBrand("vioz", "我那台白色的风扇", null);
+    t(r2.brand === "unknown", "brand③: 型号认不出 → unknown,绝不信申报(反向验证)");
+    // 销售记录里的型号 > 客户口述的型号
+    const r3 = resolveBrand("", "unknown thing", "FS 563L");
+    t(r3.brand === "fanz", "brand③: 销售记录型号优先(record FS→fanz)");
+    // 正常一致:不误报
+    const r4 = resolveBrand("fanz", "Grande 523", null);
+    t(r4.brand === "fanz" && !r4.mismatch, "brand③: 申报与推断一致 → 无告警");
+  }
+
+  // ── ④ 出站钱承诺检测:抓"承诺给好处",放过"提到钱" ──
+  const { detectOutboundMoneyPromise } = require("./lib/guards");
+  {
+    // 该拦的(模型主动承诺)
+    for (const s of [
+      "没问题，这次免费帮你换新的接收器。",
+      "We can do the repair for free since it's a small issue.",
+      "Don't worry, we won't charge you for this visit.",
+      "I can waive the fee for you this time.",
+      "Servis kali ni percuma ya, jangan risau.",
+      "好的，帮你免掉这次的上门费。",
+      "I'll give you a special discount on the replacement part.",
+    ]) t(!!detectOutboundMoneyPromise(s), `outbound④ 拦: ${s.slice(0, 30)}`);
+    // 不该误伤的(提到钱/正常用语)
+    for (const s of [
+      "Feel free to DM us anytime ya.",
+      "On-site service is RM60 per trip, the technician confirms on site.",
+      "价钱和折扣方面我帮你转给同事跟进哦，他们会尽快联络你。",
+      "Pricing and discounts I will leave to my colleague to follow up ya.",
+      "上门服务费是 RM60 一趟，师傅到场再确认。",
+      "请问你的风扇是什么型号呢？",
+    ]) t(!detectOutboundMoneyPromise(s), `outbound④ 放: ${s.slice(0, 30)}`);
+  }
 }
 
 // ============================================

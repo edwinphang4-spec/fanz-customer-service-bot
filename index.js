@@ -25,7 +25,7 @@ const { calcWarrantyStatus, isWarrantyVoid, inferBrand, POLICY_DISCLAIMER, WARRA
 // Deterministic guards — money red lines, trilingual detection, nudge, scripts.
 // The money rules are enforced HERE in code, not only in the prompt:
 // a drifting LLM cannot leak a discount/compensation reply past this layer.
-const { detectLang3, detectMoneyIntent, detectRepairIntent, isNudge, script } = require("./lib/guards");
+const { detectLang3, detectMoneyIntent, detectOutboundMoneyPromise, detectRepairIntent, isNudge, script } = require("./lib/guards");
 
 // Test hook: allow requiring this module (for the system prompt and helpers)
 // without starting the Telegram poller — same pattern as the marketing bot.
@@ -175,6 +175,60 @@ function appendHistory(chatId, role, content) {
 
 function clearHistory(chatId) {
   conversations.delete(chatId);
+}
+
+// ── ③ 品牌解析:代码推断是唯一依据 ─────────────────
+// claimed(模型/客户申报)只用来做不一致告警。销售记录里的型号 > 客户说的型号。
+// 两边都推不出来 → unknown(不下保修结论,转人工),⛔ 绝不退回信 claimed。
+function resolveBrand(claimed, dataModel, recordModel) {
+  const fromRecord = recordModel ? inferBrand(recordModel) : "unknown";
+  const fromData = dataModel ? inferBrand(dataModel) : "unknown";
+  const brand = fromRecord !== "unknown" ? fromRecord : fromData;
+  const c = (claimed || "").toLowerCase();
+  const mismatch = (c === "fanz" || c === "vioz") && brand !== "unknown" && c !== brand;
+  return { brand, mismatch, claimed: c || null };
+}
+
+// ── ② 冷启动水合:部署不再失忆 ─────────────────────
+// 进程重启清空内存 Map → 报修到第 4 步的客户被从头再来。首次遇到某 chatId
+// 时从 conversations 表捞回最近历史。(方案搬自 marketing bot 的 hydrateHistory)
+//
+// 两类行必须滤掉:
+// 1. 埋点行(intent 是守卫类 / content 带 [guard] 前缀)——那是运维数据不是对话,
+//    尤其 outbound_money_blocked 存的就是被拦下的钱承诺,水合回来=下轮接着承诺。
+// 2. 别的 bot 的发言:conversations 表是 CS/marketing/dashboard 共用的,同一个
+//    chat_id(比如 Edwin 自己)可能同时和两个 bot 聊过。assistant 行按 sender_name
+//    区分(Fann vs Mark);user 行无法区分,只能保留 —— 已知局限,真实客户只会
+//    和一个 bot 聊,混聊的只有内部测试号。
+const GUARD_INTENTS = new Set(["outbound_money_blocked", "promise_blocked", "promise_fallback", "title_draft_missed"]);
+const hydrated = new Set(); // 每进程每 chat 只水合一次
+async function hydrateHistory(chatId) {
+  if (hydrated.has(chatId)) return;
+  hydrated.add(chatId);
+  if (getHistory(chatId).length > 0) return; // 进程内已有活跃历史,不覆盖
+  if (!SUPABASE_HEADERS) return;
+  try {
+    const q = `${SUPABASE_URL}/rest/v1/conversations?chat_id=eq.${encodeURIComponent(String(chatId))}` +
+      `&select=role,content,intent,sender_name,created_at&order=created_at.desc&limit=${MAX_HISTORY * 2}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    let rows;
+    try {
+      const r = await fetch(q, { headers: SUPABASE_HEADERS, signal: controller.signal });
+      if (!r.ok) return;
+      rows = await r.json();
+    } finally { clearTimeout(timer); }
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    const hist = rows
+      .reverse()
+      .filter((r) => (r.role === "user" || r.role === "assistant") && r.content && String(r.content).trim())
+      .filter((r) => !GUARD_INTENTS.has(r.intent) && !String(r.content).startsWith("[guard]"))
+      .filter((r) => r.role !== "assistant" || !r.sender_name || r.sender_name === BOT_SENDER_NAME)
+      .map((r) => ({ role: r.role, content: String(r.content) }));
+    if (hist.length) conversations.set(chatId, hist.slice(-MAX_HISTORY));
+  } catch (err) {
+    console.warn(`[hydrate] failed for ${chatId}: ${err.message}`); // 失败=无历史,不挡回复
+  }
 }
 
 // ── OpenRouter Call ──────────────────────────────
@@ -886,6 +940,9 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || "").trim();
 
+  // ② 冷启动水合:重启/部署后第一条消息先把历史捞回来,报修不用从头再来
+  await hydrateHistory(chatId);
+
   // Remember the customer's display name for the conversation log's sender_name.
   const fromName = msg.from
     ? [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ").trim() || msg.from.username || null
@@ -1091,22 +1148,46 @@ async function processCustomerText(chatId, text, opts = {}) {
     appendHistory(chatId, "assistant", reply);
 
     // Parse marker from response
-    const { clean, marker, data } = parseMarker(reply);
+    let { clean, marker, data } = parseMarker(reply);
 
     // Detect language from conversation history (not just current message)
     const lang = detectLangFromHistory(chatId, text);
+
+    // ── ④ 出站钱扫描:模型的嘴也要过守卫 ──
+    // 入站守卫只拦客户的话;模型自己说"免费帮你换"这里拦。
+    // 拦法和入站不同:入站是"客户在问"(转人工即可),出站是"模型在承诺" ——
+    // 承诺话术不出门,但动作照执行(工单该开还开,代码确认语顶上)。
+    const moneyLeak = detectOutboundMoneyPromise(clean);
+    if (moneyLeak) {
+      console.warn(`[outbound-money] blocked "${moneyLeak}" — chat=${chatId}`);
+      // 埋点([guard] 前缀 + 专用 intent:dashboard 过滤、水合过滤都认它)
+      void logConversation(chatId, "assistant", `[guard] outbound money promise blocked ("${moneyLeak}"): ${clean.slice(0, 300)}`, { intent: "outbound_money_blocked" });
+      // 记忆修正:被拦的原话已进内存历史,换成 system note ——
+      // 留着它,模型下一轮会"我刚才说了免费啊"接着承诺。
+      const h = conversations.get(chatId);
+      if (h && h.length && h[h.length - 1].role === "assistant") {
+        h[h.length - 1] = { role: "assistant", content: "[system note: your previous reply promised free service or a discount, which you are NOT authorized to offer. It was not sent. Continue helping without any money promises — pricing and fees go to a colleague.]" };
+      }
+      if (marker) {
+        clean = ""; // 动作分支的确认语由代码拼(保修判定/workorder_recorded),不缺这段话
+      } else {
+        await sendWithSplit(chatId, script("discount", lang), undefined, { aiModel: "deterministic", intent: "outbound_money_blocked" });
+        return;
+      }
+    }
 
     // ── Process WORKORDER_READY marker ──────────────
     if (marker === "WORKORDER_READY" && data) {
       let warrantyMsg = "";
       let warrantyStatus = "unknown";
 
-      // Resolve brand: marker value first, then model inference. If still
-      // unknown, calcWarrantyStatus refuses brand-sensitive verdicts (R6).
-      let brand = (data.brand || "").toLowerCase();
-      if (brand !== "fanz" && brand !== "vioz") {
-        brand = inferBrand(data.model);
-      }
+      // ③ 品牌一律代码推(2026-08-10 Edwin):47 型号目录代码 100% 能推,
+      // 模型/客户申报的 brand 只做参考和不一致告警,绝不作为判定依据 ——
+      // AXEL16 被判成 FANZ 那类错 = 报错保修年限 = 钱的纠纷。
+      // 推不出来就是 unknown → calcWarrantyStatus 拒绝品牌敏感判定,转人工。
+      // ⛔ 绝不能因为推不出来就退回信模型说的。
+      let br = resolveBrand(data.brand, data.model, null);
+      let brand = br.brand;
       data.brand = brand;
       data.has_media = Boolean(data.has_media) || mediaSeen.get(chatId) === true;
 
@@ -1118,6 +1199,13 @@ async function processCustomerText(chatId, text, opts = {}) {
       if (data.invoice && !invoiceIsPhoto) {
         const record = await lookupInvoice(data.invoice.trim());
         if (record) {
+          // 销售记录里的型号是最权威的品牌来源(库里的原始数据),优先于客户口述
+          br = resolveBrand(data.brand, data.model, record.model);
+          brand = br.brand;
+          data.brand = brand;
+          if (br.mismatch) {
+            console.warn(`[brand] 申报品牌(${br.claimed})与代码推断(${brand})不一致 — 以代码为准, chat=${chatId}, model=${data.model}, record=${record.model}`);
+          }
           const wResult = calcWarrantyStatus(
             record.purchase_date,
             data.issue_type || "unknown",
@@ -1212,7 +1300,9 @@ async function processCustomerText(chatId, text, opts = {}) {
     if (marker === "COMPLAINT_READY" && data) {
       const inserted = await insertComplaint(chatId, data.category, data.content);
 
-      let finalMsg = clean;
+      // clean 可能被出站钱扫描清空 —— 投诉分支原本没有兜底文案,补上,
+      // 不然客户收到一条空消息(比收到承诺更糟的是收到沉默)。
+      let finalMsg = clean || tr("handoff_recorded", lang);
       if (!inserted) {
         finalMsg += "\n\n" + tr("complaint_busy", lang);
       }
@@ -1292,6 +1382,10 @@ module.exports = {
   askOpenRouter, // LLM caller with timeout+retry, exported for tests
   buildPreliminaryWarrantyMsg, // pure helper, exported for tests
   isDateConfirmation, // pure helper, exported for tests
+  resolveBrand, // ③ 品牌解析(代码推断唯一依据), pure helper
+  hydrateHistory, // ② 冷启动水合
+  getHistoryForTest: getHistory,
+  __clearChat: (chatId) => { conversations.delete(chatId); hydrated.delete(chatId); },
   // scenario-test seams (SKIP_BOT_INIT only)
   __setPendingInvoice: (chatId, p) => pendingInvoiceRead.set(chatId, p),
   __getPendingInvoice: (chatId) => pendingInvoiceRead.get(chatId),
