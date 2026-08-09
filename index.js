@@ -27,6 +27,9 @@ const { calcWarrantyStatus, isWarrantyVoid, inferBrand, POLICY_DISCLAIMER, WARRA
 // a drifting LLM cannot leak a discount/compensation reply past this layer.
 const { detectLang3, detectMoneyIntent, detectOutboundMoneyPromise, detectRepairIntent, isNudge, script } = require("./lib/guards");
 
+// 长期客户记忆(R5 复发识别):纯函数在 lib,查库在下面 getCustomerOrders
+const { findRecurrence, buildCustomerNote } = require("./lib/customer-history");
+
 // Test hook: allow requiring this module (for the system prompt and helpers)
 // without starting the Telegram poller — same pattern as the marketing bot.
 const SKIP_BOT_INIT = process.env.SKIP_BOT_INIT === "1" || process.env.SKIP_PROMPT_ONLY === "1";
@@ -145,7 +148,9 @@ LINE C — Complaint: Listen properly, acknowledge, say will pass to the relevan
 
 8. Messages prefixed "[voice message, transcribed]" are the customer's spoken words converted to text. Treat them as normal customer messages. Transcription can contain small errors — if a critical detail (model, address, invoice number) seems garbled, confirm it briefly instead of guessing.
 
-9. If not sure about something, just say so and offer to pass to human team.`;
+9. If not sure about something, just say so and offer to pass to human team.
+
+10. PREVIOUS REPAIRS THE SYSTEM CANNOT FIND: If the customer refers to an earlier repair/visit/report and there is NO "[system note: RETURNING CUSTOMER...]" in this conversation, that does NOT mean the customer is wrong — our records may be incomplete (repairs before this system existed are not in it). NEVER deny their history. STRICTLY FORBIDDEN: "你没有报修记录", "we have no record of your repair", "tiada rekod", or any wording that implies their previous repair did not happen. Instead: say you cannot pull up the earlier record right now, ask them to briefly describe what happened last time, and continue helping from there.`;
 }
 
 const SYSTEM_PROMPT = buildSystemPrompt();
@@ -385,6 +390,38 @@ async function insertEscalation(chatId, reason, summary) {
 // Cache per chat for 10 minutes to avoid a query on every message.
 const unpaidCache = new Map(); // chatId -> { unpaid: boolean, at: ms }
 const UNPAID_CACHE_MS = 10 * 60_000;
+
+// ── 长期客户记忆:查这个 chat 的既有工单(60s 缓存,和 unpaidCache 同款)──
+const ordersCache = new Map(); // chatId -> { orders, at }
+const ORDERS_CACHE_MS = 60_000;
+async function getCustomerOrders(chatId) {
+  if (!SUPABASE_SERVICE_KEY) return [];
+  const cached = ordersCache.get(chatId);
+  if (cached && Date.now() - cached.at < ORDERS_CACHE_MS) return cached.orders;
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/work_orders?chat_id=eq.${encodeURIComponent(String(chatId))}` +
+      `&select=model,issue,issue_type,brand,address,created_at&order=created_at.desc&limit=20`;
+    const resp = await fetch(url, { headers: SUPABASE_HEADERS });
+    if (!resp.ok) { ordersCache.set(chatId, { orders: [], at: Date.now() }); return []; }
+    const rows = await resp.json();
+    const orders = Array.isArray(rows) ? rows : [];
+    ordersCache.set(chatId, { orders, at: Date.now() });
+    return orders;
+  } catch (err) {
+    console.error("[customerHistory] error:", err.message);
+    return [];
+  }
+}
+
+// 回头客 note 每进程每 chat 只注入一次(注多了淹历史)
+const customerNoteInjected = new Set();
+async function injectCustomerContext(chatId) {
+  if (customerNoteInjected.has(chatId)) return;
+  customerNoteInjected.add(chatId);
+  const orders = await getCustomerOrders(chatId);
+  const note = buildCustomerNote(orders);
+  if (note) appendHistory(chatId, "assistant", note);
+}
 
 async function hasUnpaidOrder(chatId) {
   if (!SUPABASE_SERVICE_KEY) return false;
@@ -1131,6 +1168,10 @@ async function processCustomerText(chatId, text, opts = {}) {
     return;
   }
 
+  // ── 长期客户记忆:代码查好、算好,以 system note 进上下文,模型只负责说得自然 ──
+  // (放在确定性守卫之后:守卫命中就不进 LLM,不用白查一趟)
+  await injectCustomerContext(chatId);
+
   try {
     // Build message array: system + history + current message
     const history = getHistory(chatId);
@@ -1270,9 +1311,28 @@ async function processCustomerText(chatId, text, opts = {}) {
         warrantyMsg = tr("warranty_photo", lang);
       }
 
+      // ── 复发识别:落库前对既有工单算一次(代码算,不靠模型)──
+      // 复发单标记升级:写一条 [ESCALATION:recurring_issue],复发第 N 次这个事实
+      // 不能只有 bot 自己知道 —— 它落在 complaints 表,dashboard 看得到,
+      // 将来工单通知群建好后直接推这条(两件事共用一条管道)。
+      let recurrence = null;
+      try {
+        recurrence = findRecurrence(await getCustomerOrders(chatId), data.model, data.issue_type);
+      } catch (err) { console.error("[recurrence] check failed:", err.message); }
+
       // Insert work order into Supabase
       const orderData = { ...data, chatId: String(chatId) };
       const inserted = await insertWorkOrder(orderData, warrantyStatus);
+      ordersCache.delete(chatId); // 新单落库,缓存失效
+
+      if (inserted && recurrence) {
+        const nth = recurrence.count + 1;
+        console.warn(`[recurrence] chat=${chatId} ${data.model} 第 ${nth} 次报修 (上次 ${String(recurrence.lastAt).slice(0, 10)})`);
+        await insertEscalation(chatId, "recurring_issue",
+          `同一台 ${recurrence.model} 第 ${nth} 次报修` +
+          (recurrence.sameIssueCount ? `(同类问题第 ${recurrence.sameIssueCount + 1} 次)` : "") +
+          `,上次 ${String(recurrence.lastAt).slice(0, 10)} — 优先处理`);
+      }
 
       // Append to Google Sheet (non-blocking, log-only on failure)
       appendToSheet([String(chatId), data.model, data.issue, data.issue_type, data.country || "MY", data.invoice, warrantyStatus, data.address, data.preferred_time || data.preferredTime || "", new Date().toISOString()]);
@@ -1384,6 +1444,8 @@ module.exports = {
   isDateConfirmation, // pure helper, exported for tests
   resolveBrand, // ③ 品牌解析(代码推断唯一依据), pure helper
   hydrateHistory, // ② 冷启动水合
+  getCustomerOrders, // R5 客户工单历史(带缓存)
+  injectCustomerContext, // R5 回头客 note 注入
   getHistoryForTest: getHistory,
   __clearChat: (chatId) => { conversations.delete(chatId); hydrated.delete(chatId); },
   // scenario-test seams (SKIP_BOT_INIT only)

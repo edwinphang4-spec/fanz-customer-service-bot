@@ -124,6 +124,26 @@ function tier0() {
       "请问你的风扇是什么型号呢？",
     ]) t(!detectOutboundMoneyPromise(s), `outbound④ 放: ${s.slice(0, 30)}`);
   }
+
+  // ── R5 复发识别:代码算,型号写法不一致也要认得出 ──
+  const { modelKey, findRecurrence, buildCustomerNote } = require("./lib/customer-history");
+  {
+    t(modelKey("FS Series 563 L") === modelKey("FS563L"), "R5: 'FS Series 563 L' 与 'FS563L' 同键(归一化+数字)");
+    t(modelKey("FS423") !== modelKey("FS563L"), "R5: 同家族不同型号(FS423 vs FS563)不误判成同一台");
+    t(modelKey("unknown") === null && modelKey("我那台白色的风扇") === null, "R5: 认不出的型号 → null,不参与匹配");
+
+    const prior = [{ model: "FS Series 563 L", issue_type: "motor", created_at: "2026-07-24T09:37:41Z", address: "Jalan Permas 15/2" }];
+    const rec = findRecurrence(prior, "FS563L", "motor");
+    t(rec && rec.count === 1 && rec.sameIssueCount === 1, "R5: 复发认得出(跨写法+同类问题)");
+    t(findRecurrence([], "FS563L", "motor") === null, "R5: 新客户(无历史)不误判成复发(反向验证)");
+    t(findRecurrence(prior, "GAZE52L", "motor") === null, "R5: 不同风扇不误判成复发(反向验证)");
+    t(findRecurrence(prior, "FS563L", "unknown")?.sameIssueCount === 0, "R5: issue_type unknown 不做同类判定(宁可漏检)");
+
+    const note = buildCustomerNote(prior);
+    t(/FS Series 563 L/.test(note) && /empathy/i.test(note), "R5: note 含型号 + 共情要求");
+    t(/NEVER state whether any previous order was resolved/.test(note), "R5: note 写死不许提工单状态(信号退化,宁可不说)");
+    t(buildCustomerNote([]) === null, "R5: 无历史不注入 note");
+  }
 }
 
 // ============================================
@@ -134,6 +154,29 @@ function tier0() {
 const MODEL = process.env.MODEL || "gpt-4o";
 
 const TIER1_CASES = [
+  // -- R5 复发识别:回头客不许当第一次见面 --
+  {
+    name: "R5 returning customer — same fan, skip re-intake + empathy",
+    seed: [{
+      role: "assistant",
+      content: "[system note: RETURNING CUSTOMER — this chat has 1 previous repair record(s) in our system:\n- FS Series 563 L | motor | 2026-07-24 | address on file: Jalan Permas 15/2, Bandar Baru Permas Jaya\nIf the current message is about a fan problem, do NOT restart the intake as if meeting them for the first time:\n(1) FIRST confirm whether it is the same fan again — name it in their language (e.g. \"是上次那台 FS Series 563 L 又出问题吗?\" — vary the wording naturally).\n(2) Acknowledge the repeat trouble with brief, genuine empathy BEFORE any process talk.\n(3) If they confirm it is the same fan, do NOT re-ask model/brand — use the record above. For the address, confirm the one on file instead of asking from scratch.\n(4) NEVER state whether any previous order was resolved, unresolved, or being handled — you do not know its status. Do not mention order status at all.\n(5) If they say it is a different fan, run the normal intake.]",
+    }],
+    messages: ["我的风扇又坏了，跟上次一样有声音"],
+    // 红线:不许从头问型号(那是激怒复发客户的问法),不许瞎报上次单的状态
+    forbidden: [/什么型号|哪个型号|型号是什么|which model|what model|model apa/i, /正在处理|已经处理|处理好|is being handled|already (fixed|resolved)/i],
+    // 必须点名上次那台(引用记录),体现"认得你"
+    required: [/FS|563|上次/i],
+    red: true,
+  },
+  {
+    name: "R5 claimed history not in system — never deny",
+    messages: ["我上次报修过的那个风扇又出问题了，你们查一下上次的记录"],
+    // 红线:系统查不到 ≠ 客户在撒谎。禁止任何"你没有记录"式打脸
+    forbidden: [/没有.{0,6}(报修|维修)?记录|查不到你的记录|no record|we don'?t have.{0,20}record|tiada rekod/i],
+    // 要么请他描述上次情况,要么继续帮忙 —— 语言自然即可
+    required: [/上次|之前|什么情况|describe|last time|tell me/i],
+    red: true,
+  },
   // -- 钱红线：防线漏网的改写句式 --
   {
     name: "discount paraphrase (guard-evading)",
@@ -271,6 +314,9 @@ async function tier1() {
 
   for (const c of TIER1_CASES) {
     const messages = [{ role: "system", content: SYSTEM_PROMPT }];
+    // seed:预置历史(如回头客的 [system note: RETURNING CUSTOMER...]),
+    // 模拟生产里 injectCustomerContext 注入后的状态
+    for (const s of c.seed || []) messages.push(s);
     let reply = "";
     try {
       for (const m of c.messages) {
