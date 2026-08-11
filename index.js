@@ -423,6 +423,30 @@ async function injectCustomerContext(chatId) {
   if (note) appendHistory(chatId, "assistant", note);
 }
 
+// ── 保修判定落库(migrations/0004) ─────────────────
+// 每次判完保修,结论只存在于对话文字里 —— "这个月查了几次、多少台过保"查不出来。
+// 这里记的是**代码算出来的**结论(calcWarrantyStatus / buildPreliminaryWarrantyMsg),
+// 不是模型说的话,所以值得当数据存。fire-and-forget:绝不挡回复;
+// 表不存在(迁移没跑)就静默跳过,只 warn 一次。
+let warrantyTableMissing = false;
+async function logWarrantyCheck(fields) {
+  if (!SUPABASE_SERVICE_KEY || warrantyTableMissing) return;
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/warranty_checks`, {
+      method: "POST", headers: SUPABASE_HEADERS, body: JSON.stringify(fields),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      if (/PGRST205|42P01|could not find the table/i.test(t)) {
+        warrantyTableMissing = true;
+        console.warn("[warrantyCheck] 表不存在 —— 跳过记录(请跑 migrations/0004)");
+      } else {
+        console.warn(`[warrantyCheck] insert failed ${r.status}: ${t.slice(0, 160)}`);
+      }
+    }
+  } catch (err) { console.warn("[warrantyCheck] error:", err.message); }
+}
+
 async function hasUnpaidOrder(chatId) {
   if (!SUPABASE_SERVICE_KEY) return false;
   const cached = unpaidCache.get(chatId);
@@ -1143,6 +1167,20 @@ async function processCustomerText(chatId, text, opts = {}) {
     if (fresh && isDateConfirmation(text)) {
       const prelimMsg = buildPreliminaryWarrantyMsg(pendingInv, langNow);
       if (prelimMsg) {
+        // 初判也落库 —— 发票照片这条路(经销商发票不在 sales_records)是主流路径,
+        // 不记的话统计里会缺掉大半。inWarranty 从同一份代码算,不重算避免漂移。
+        {
+          const years = (WARRANTY_PERIODS[pendingInv.brand] || {}).motor || null;
+          const exp = years ? new Date(pendingInv.dateIso) : null;
+          if (exp) exp.setFullYear(exp.getFullYear() + years);
+          void logWarrantyCheck({
+            chat_id: String(chatId), model: null, brand: pendingInv.brand,
+            issue_type: "motor", purchase_date: pendingInv.dateIso,
+            verdict: exp && new Date() < exp ? "in_warranty" : "out_of_warranty",
+            warranty_years: years, charge: null, country: "MY",
+            source: "preliminary_photo",
+          });
+        }
         appendHistory(chatId, "user", historyText);
         appendHistory(chatId, "assistant",
           `[system note: a preliminary warranty assessment was sent based on the customer-confirmed invoice date (brand=${pendingInv.brand}, purchase_date=${pendingInv.dateIso}). The invoice step is DONE (invoice:"photo"). Continue the intake from where it left off (issue part if unknown, then address, then preferred time). Never restate or contradict the assessment — final verification is by a colleague.]`);
@@ -1257,6 +1295,17 @@ async function processCustomerText(chatId, text, opts = {}) {
             ? "unknown"
             : wResult.inWarranty ? "in_warranty" : "out_of_warranty";
 
+          void logWarrantyCheck({
+            chat_id: String(chatId), model: record.model, brand,
+            issue_type: data.issue_type || "unknown",
+            purchase_date: record.purchase_date || null,
+            verdict: wResult.needsBrand ? "needs_brand" : (wResult.inWarranty ? "in_warranty" : "out_of_warranty"),
+            warranty_years: wResult.warrantyPeriodYears || null,
+            charge: wResult.chargeIfOver || null,
+            country: data.country || "MY",
+            source: "invoice_lookup",
+          });
+
           // Build warranty message
           const issueTypeMap = {
             motor: "马达/Motor",
@@ -1304,6 +1353,14 @@ async function processCustomerText(chatId, text, opts = {}) {
           warrantyMsg += `\n\n*以上是根据 invoice 记录的信息。${POLICY_DISCLAIMER}*`;
         } else {
           warrantyMsg = tr("warranty_not_found", lang);
+          // 查不到也记 —— "多少客户报的发票号我们库里没有"本身就是要看的数
+          // (sales_records 现在只有 10 行样本数据,真实销售库从没导入过)
+          void logWarrantyCheck({
+            chat_id: String(chatId), model: data.model || null, brand,
+            issue_type: data.issue_type || "unknown", purchase_date: null,
+            verdict: "not_found", warranty_years: null, charge: null,
+            country: data.country || "MY", source: "invoice_lookup",
+          });
         }
       } else if (invoiceIsPhoto) {
         // Customer provided invoice as a photo (e.g. dealer invoice) —
