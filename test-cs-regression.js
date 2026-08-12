@@ -125,6 +125,38 @@ function tier0() {
     ]) t(!detectOutboundMoneyPromise(s), `outbound④ 放: ${s.slice(0, 30)}`);
   }
 
+  // ── 出站 IC 防线(PDPA):误伤优先于漏检 ──
+  const { detectICLeak, redactIC } = require("./lib/guards");
+  {
+    // 该遮的:标准带横杠格式 + 带 IC 字样的 12 位连号
+    for (const s of [
+      "师傅是张三，IC 880101-01-5555，电话 012-3456789",
+      "Technician: Ahmad, NRIC 900215-14-1234",
+      "Teknisyen kami Ali, no. KP 750630-08-5432",
+      "师傅身份证号码 880101015555",
+      "our technician IC 900215141234 will come",
+    ]) t(detectICLeak(s).length > 0, `IC 遮蔽 命中: ${s.slice(0, 34)}`);
+
+    // ⛔ 绝不能误伤的(Edwin 点名的三类 + 常见变体)
+    for (const s of [
+      "师傅电话 012-3456789，车牌 JQA 1234",          // 马来西亚手机 3-7
+      "call 011-12345678 ya",                          // 11 位手机
+      "WhatsApp +60123456789",                         // 国际格式 11 位
+      "WhatsApp +601112345678",                        // 国际格式 12 位 ← 最危险的那个
+      "发票号 INV-2026-0010",                          // 发票号
+      "订单号 260812000123",                           // YYMMDD+流水,12 位且日期合法
+      "your order 202608120001 is ready",              // 12 位订单号
+      "上门服务费 RM60 一趟",
+      "购买日期 2026-08-12",                            // 日期
+      "型号 FS 563 L，保修到 2035-04-20",
+    ]) t(detectICLeak(s).length === 0, `IC 遮蔽 不误伤: ${s.slice(0, 34)} (误判为 ${JSON.stringify(detectICLeak(s))})`);
+
+    // 遮蔽行为:只遮 IC,其余原样(电话必须留着 —— 客户要靠它联络师傅)
+    const red = redactIC("师傅张三，IC 880101-01-5555，电话 012-3456789");
+    t(/\[IC redacted\]/.test(red) && !/880101-01-5555/.test(red), "IC 被遮掉");
+    t(/012-3456789/.test(red) && /张三/.test(red), "电话和姓名原样保留(遮蔽不是拦截)");
+  }
+
   // ── R5 复发识别:代码算,型号写法不一致也要认得出 ──
   const { modelKey, findRecurrence, buildCustomerNote } = require("./lib/customer-history");
   {

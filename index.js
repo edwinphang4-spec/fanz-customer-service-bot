@@ -25,7 +25,7 @@ const { calcWarrantyStatus, isWarrantyVoid, inferBrand, POLICY_DISCLAIMER, WARRA
 // Deterministic guards — money red lines, trilingual detection, nudge, scripts.
 // The money rules are enforced HERE in code, not only in the prompt:
 // a drifting LLM cannot leak a discount/compensation reply past this layer.
-const { detectLang3, detectMoneyIntent, detectOutboundMoneyPromise, detectRepairIntent, isNudge, script } = require("./lib/guards");
+const { detectLang3, detectMoneyIntent, detectOutboundMoneyPromise, detectICLeak, redactIC, detectRepairIntent, isNudge, script } = require("./lib/guards");
 
 // 长期客户记忆(R5 复发识别):纯函数在 lib,查库在下面 getCustomerOrders
 const { findRecurrence, buildCustomerNote } = require("./lib/customer-history");
@@ -205,7 +205,7 @@ function resolveBrand(claimed, dataModel, recordModel) {
 //    chat_id(比如 Edwin 自己)可能同时和两个 bot 聊过。assistant 行按 sender_name
 //    区分(Fann vs Mark);user 行无法区分,只能保留 —— 已知局限,真实客户只会
 //    和一个 bot 聊,混聊的只有内部测试号。
-const GUARD_INTENTS = new Set(["outbound_money_blocked", "promise_blocked", "promise_fallback", "title_draft_missed"]);
+const GUARD_INTENTS = new Set(["outbound_money_blocked", "ic_redacted", "promise_blocked", "promise_fallback", "title_draft_missed"]);
 const hydrated = new Set(); // 每进程每 chat 只水合一次
 async function hydrateHistory(chatId) {
   if (hydrated.has(chatId)) return;
@@ -1236,6 +1236,16 @@ async function processCustomerText(chatId, text, opts = {}) {
     // 入站守卫只拦客户的话;模型自己说"免费帮你换"这里拦。
     // 拦法和入站不同:入站是"客户在问"(转人工即可),出站是"模型在承诺" ——
     // 承诺话术不出门,但动作照执行(工单该开还开,代码确认语顶上)。
+    // ── 出站 IC 防线(PDPA)──
+    // 遮蔽不拦截:IC 遮掉,回复其余部分照发。今天 bot 手上没有师傅资料,
+    // 这里应该永远不命中 —— 命中就说明多了一条泄露 IC 的路径,埋点会记下来。
+    const icLeaks = detectICLeak(clean);
+    if (icLeaks.length) {
+      console.warn(`[ic-guard] redacted ${icLeaks.length} IC(s) — chat=${chatId}`);
+      void logConversation(chatId, "assistant", `[guard] IC redacted (${icLeaks.length}): ${clean.slice(0, 300)}`, { intent: "ic_redacted" });
+      clean = redactIC(clean);
+    }
+
     const moneyLeak = detectOutboundMoneyPromise(clean);
     if (moneyLeak) {
       console.warn(`[outbound-money] blocked "${moneyLeak}" — chat=${chatId}`);
